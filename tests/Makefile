@@ -10,3 +10,6 @@ all:
 	$(CC) $(INCLUDES) $(CPPFLAGS) -std=c++0x test_cpp_compilation.cpp -lm -lstdc++
 	$(CC) $(INCLUDES) $(CFLAGS) -DIWT_TEST image_write_test.c -lm -o image_write_test
 	$(CC) $(INCLUDES) $(CFLAGS) fuzz_main.c stbi_read_fuzzer.c -lm -o image_fuzzer
+
+font_render_verify: font_render_verify.c font_render.h
+	$(CC) $(INCLUDES) $(CFLAGS) -O2 font_render_verify.c -lm -o font_render_verify
