@@ -1,0 +1,1 @@
+samples=2000 rejected=1414 decoded=586 missing_reason=0

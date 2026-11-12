@@ -1,0 +1,12 @@
+ok  bomb rejected: too large @ offset 54
+ok  largest allocation was 0 bytes (<= 256 MB cap)
+ok  1 MB cap rejection: too large @ offset 54
+ok  no malloc exceeded 1 MB (max seen 0)
+ok  valid image decoded under tight cap (37x23)
+ok  cap disabled, bomb still rejected by format checks (too large)
+ok  alloc cap fired for 400 MB PNG: image too large (allocation cap exceeded) @ offset 65
+ok  allocator never exceeded cap (max seen 4096)
+ok  zlib bomb rejected at 0.3 MB: image too large (allocation cap exceeded) @ offset 314988
+ok  intermediate buffer never exceeded cap
+ok  failure located at offset 8 of 8: first not IHDR @ offset 8
+ALL GUARD TESTS PASSED

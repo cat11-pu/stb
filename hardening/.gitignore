@@ -1,0 +1,15 @@
+# build artifacts and bulky pixel dumps from run_all.sh
+reports/crash_asan
+reports/crash_plain
+reports/test_guards
+reports/dump_baseline
+reports/dump_hardened
+reports/bench_base
+reports/bench_hard
+reports/gen_valid
+reports/genbig
+reports/genbig.c
+reports/pix_base/
+reports/pix_hard/
+reports/png_base/
+reports/png_hard/

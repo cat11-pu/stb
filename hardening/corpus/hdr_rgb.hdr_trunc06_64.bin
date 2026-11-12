@@ -1,0 +1,3 @@
+#?RADIANCE
+# Written by stb_image_write.h
+FORMAT=32-bit_rle_rgbe

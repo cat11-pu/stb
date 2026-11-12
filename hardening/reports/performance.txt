@@ -1,0 +1,7 @@
+image                        base median (s) hard median (s)     delta
+stbi_big.png                          9.1946          9.2578     0.69% OK
+stbi_big.jpg                          9.9033          9.9907     0.88% OK
+stbi_big.bmp                          5.3804          5.2663    -2.12% OK
+stbi_big.tga                          7.1248          7.0722    -0.74% OK
+stbi_big_gray.png                     2.4135          2.4073    -0.26% OK
+performance budget: +10% per-image decode time
