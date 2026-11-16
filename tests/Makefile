@@ -10,3 +10,9 @@ all:
 	$(CC) $(INCLUDES) $(CPPFLAGS) -std=c++0x test_cpp_compilation.cpp -lm -lstdc++
 	$(CC) $(INCLUDES) $(CFLAGS) -DIWT_TEST image_write_test.c -lm -o image_write_test
 	$(CC) $(INCLUDES) $(CFLAGS) fuzz_main.c stbi_read_fuzzer.c -lm -o image_fuzzer
+
+test_image_region: test_image_region.c ../stb_image.h ../stb_image_write.h
+	$(CC) $(INCLUDES) -std=c99 -O2 -Wall -Wextra test_image_region.c -lm -o $@
+
+region: test_image_region
+	./test_image_region

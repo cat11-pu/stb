@@ -433,6 +433,38 @@ STBIDEF stbi_uc *stbi_load_from_file  (FILE *f, int *x, int *y, int *channels_in
 STBIDEF stbi_uc *stbi_load_gif_from_memory(stbi_uc const *buffer, int len, int **delays, int *x, int *y, int *z, int *comp, int req_comp);
 #endif
 
+////////////////////////////////////
+//
+// Narrow streaming PNG region interface
+//
+// The output is always tightly packed, top-to-bottom RGBA8 (4 bytes per
+// pixel), independent of the PNG color type, bit depth, palette, or tRNS
+// chunks. Callback rows are only valid for the duration of the callback.
+//
+// Feed arbitrary byte chunks with stbi_region_feed(). The decoder keeps one
+// Deflate history window (32 KiB) and a small number of PNG scanlines, not a
+// decoded copy of the image. It stops decoding once the bottom row of the
+// requested rectangle has been produced.
+//
+// Only non-interlaced PNG is supported. Unsupported inputs fail explicitly.
+// Global load flags such as stbi_set_flip_vertically_on_load do not affect
+// this interface.
+
+#ifndef STBI_NO_PNG
+typedef struct stbi_region_decoder stbi_region_decoder;
+
+typedef int (*stbi_region_row_callback)(void *user, int y, const stbi_uc *rgba);
+
+STBIDEF stbi_region_decoder *stbi_region_begin(int x, int y, int width, int height,
+                                               stbi_region_row_callback row_callback,
+                                               void *user);
+STBIDEF int      stbi_region_feed(stbi_region_decoder *decoder, void const *data, int size);
+STBIDEF int      stbi_region_finish(stbi_region_decoder *decoder);
+STBIDEF int      stbi_region_complete(stbi_region_decoder const *decoder);
+STBIDEF char const *stbi_region_failure_reason(stbi_region_decoder const *decoder);
+STBIDEF void     stbi_region_free(stbi_region_decoder *decoder);
+#endif
+
 #ifdef STBI_WINDOWS_UTF8
 STBIDEF int stbi_convert_wchar_to_utf8(char *buffer, size_t bufferlen, const wchar_t* input);
 #endif
@@ -5337,6 +5369,923 @@ static int stbi__png_is16(stbi__context *s)
       return 0;
    }
    return 1;
+}
+
+#define STBI__RG_HISTORY 32768
+
+typedef struct
+{
+   int state;
+   int num_bits;
+   stbi__uint32 code_buffer;
+
+   stbi_uc const *src;
+   int src_left;
+
+   stbi__zhuffman z_length;
+   stbi__zhuffman z_distance;
+
+   int dyn_state;
+   int dyn_hlit;
+   int dyn_hdist;
+   int dyn_hclen;
+   int dyn_ntot;
+   int dyn_i;
+   int dyn_n;
+   int dyn_code;
+   stbi__zhuffman dyn_codelength;
+   stbi_uc dyn_lencodes[286+32];
+   stbi_uc dyn_sizes[19];
+
+   int final_block;
+   int huff_phase;
+   int huff_z;
+   int huff_len;
+   int huff_dist;
+
+   int stored_started;
+   int stored_header_have;
+   stbi_uc stored_header[4];
+   stbi__uint32 stored_remaining;
+} stbi__rg_zstream;
+
+struct stbi_region_decoder
+{
+   int req_x, req_y, req_w, req_h;
+   stbi_region_row_callback row_callback;
+   void *user;
+
+   int depth, color, img_n, interlace;
+   int header_ready;
+   int palette_n;
+   stbi_uc palette[256*4];
+   int has_trns;
+   stbi__uint16 trns16[3];
+   stbi_uc trns8[3];
+
+   int png_state;
+   int signature_have;
+   stbi_uc signature[8];
+   int chunk_header_have;
+   stbi_uc chunk_header[8];
+   stbi__uint32 chunk_len;
+   stbi__uint32 chunk_type;
+   stbi__uint32 chunk_left;
+   int body_have;
+   stbi_uc body[1024];
+   int idat_seen;
+
+   stbi__rg_zstream z;
+   stbi_uc window[STBI__RG_HISTORY];
+   int window_pos;
+   int window_size;
+
+   int raw_row_bytes;
+   int filter_bpp;
+   stbi_uc *in_row;
+   stbi_uc *cur_row;
+   stbi_uc *prev_row;
+   int in_row_fill;
+
+   stbi_uc *out_row;
+   int rows_done;
+
+   int failed;
+   int done;
+   int ended;
+   char const *failure;
+};
+
+enum
+{
+   STBI__RG_PNG_SIGNATURE,
+   STBI__RG_PNG_CHUNK_HEADER,
+   STBI__RG_PNG_IHDR,
+   STBI__RG_PNG_PLTE,
+   STBI__RG_PNG_TRNS,
+   STBI__RG_PNG_IDAT,
+   STBI__RG_PNG_SKIP,
+   STBI__RG_PNG_CRC
+};
+
+enum
+{
+   STBI__RG_Z_HEADER,
+   STBI__RG_Z_BLOCK_HEADER,
+   STBI__RG_Z_DYNAMIC,
+   STBI__RG_Z_HUFFMAN,
+   STBI__RG_Z_STORED,
+   STBI__RG_Z_DONE
+};
+
+enum
+{
+   STBI__RG_DYN_HEADER,
+   STBI__RG_DYN_SIZES,
+   STBI__RG_DYN_CODELENGTHS,
+   STBI__RG_DYN_REPEAT
+};
+
+static int stbi__rg_fail(stbi_region_decoder *d, char const *reason)
+{
+   if (!d->failed) {
+      d->failed = 1;
+      d->failure = reason;
+   }
+   return 0;
+}
+
+static int stbi__rg_zbyte(stbi__rg_zstream *z, stbi_uc *value)
+{
+   if (z->src_left <= 0)
+      return 0;
+   *value = *z->src++;
+   --z->src_left;
+   return 1;
+}
+
+static int stbi__rg_zneed(stbi__rg_zstream *z, int n)
+{
+   while (z->num_bits < n) {
+      stbi_uc value;
+      if (!stbi__rg_zbyte(z, &value))
+         return 0;
+      z->code_buffer |= (stbi__uint32) value << z->num_bits;
+      z->num_bits += 8;
+   }
+   return 1;
+}
+
+static stbi__uint32 stbi__rg_zreceive(stbi__rg_zstream *z, int n)
+{
+   stbi__uint32 value = z->code_buffer & (((stbi__uint32) 1 << n) - 1);
+   z->code_buffer >>= n;
+   z->num_bits -= n;
+   return value;
+}
+
+static int stbi__rg_zread_byte(stbi__rg_zstream *z, stbi_uc *value)
+{
+   if (z->num_bits >= 8) {
+      *value = (stbi_uc) (z->code_buffer & 255);
+      z->code_buffer >>= 8;
+      z->num_bits -= 8;
+      return 1;
+   }
+   return stbi__rg_zbyte(z, value);
+}
+
+// Returns the decoded symbol, -1 for invalid input, or -2 if more input is needed.
+static int stbi__rg_zdecode(stbi__rg_zstream *z, stbi__zhuffman *h)
+{
+   int b, s, k;
+   if (!stbi__rg_zneed(z, 16))
+      return -2;
+
+   b = h->fast[z->code_buffer & STBI__ZFAST_MASK];
+   if (b) {
+      s = b >> 9;
+      z->code_buffer >>= s;
+      z->num_bits -= s;
+      return b & 511;
+   }
+
+   k = stbi__bit_reverse(z->code_buffer, 16);
+   for (s=STBI__ZFAST_BITS+1; ; ++s)
+      if (k < h->maxcode[s])
+         break;
+   if (s >= 16)
+      return -1;
+   b = (k >> (16-s)) - h->firstcode[s] + h->firstsymbol[s];
+   if (b >= STBI__ZNSYMS || h->size[b] != s)
+      return -1;
+   z->code_buffer >>= s;
+   z->num_bits -= s;
+   return h->value[b];
+}
+
+static int stbi__rg_emit(stbi_region_decoder *d, stbi_uc value)
+{
+   d->window[d->window_pos] = value;
+   d->window_pos = (d->window_pos + 1) & (STBI__RG_HISTORY - 1);
+   if (d->window_size < STBI__RG_HISTORY)
+      ++d->window_size;
+
+   d->in_row[d->in_row_fill++] = value;
+   if (d->in_row_fill == d->raw_row_bytes + 1) {
+      int filter = d->in_row[0];
+      stbi_uc *raw = d->in_row + 1;
+      stbi_uc *cur = d->cur_row;
+      stbi_uc *prev = d->prev_row;
+      int i;
+
+      d->in_row_fill = 0;
+      if (filter > 4)
+         return stbi__rg_fail(d, "invalid PNG filter");
+
+      for (i=0; i < d->raw_row_bytes; ++i) {
+         int a = i >= d->filter_bpp ? cur[i-d->filter_bpp] : 0;
+         int b = prev[i];
+         int c = i >= d->filter_bpp ? prev[i-d->filter_bpp] : 0;
+         int predictor = 0;
+         switch (filter) {
+            case STBI__F_none:  predictor = 0; break;
+            case STBI__F_sub:   predictor = a; break;
+            case STBI__F_up:    predictor = b; break;
+            case STBI__F_avg:   predictor = (a + b) >> 1; break;
+            case STBI__F_paeth: predictor = stbi__paeth(a, b, c); break;
+         }
+         cur[i] = STBI__BYTECAST(raw[i] + predictor);
+      }
+
+      if (d->rows_done >= d->req_y && d->rows_done < d->req_y + d->req_h) {
+         stbi_uc *out = d->out_row;
+         int x;
+         for (x=0; x < d->req_w; ++x) {
+            int sx = d->req_x + x;
+            if (d->depth < 8) {
+               int bit = sx * d->depth;
+               int shift = 8 - d->depth - (bit & 7);
+               int value = (cur[bit >> 3] >> shift) & ((1 << d->depth) - 1);
+               if (d->color == 3) {
+                  int p;
+                  if (value >= d->palette_n)
+                     return stbi__rg_fail(d, "invalid PNG palette index");
+                  p = value * 4;
+                  out[0] = d->palette[p+0];
+                  out[1] = d->palette[p+1];
+                  out[2] = d->palette[p+2];
+                  out[3] = d->palette[p+3];
+               } else {
+                  stbi_uc gray = (stbi_uc) (stbi__depth_scale_table[d->depth] * value);
+                  stbi_uc alpha = (d->has_trns && gray == d->trns8[0]) ? 0 : 255;
+                  out[0] = out[1] = out[2] = gray;
+                  out[3] = alpha;
+               }
+            } else if (d->depth == 8) {
+               stbi_uc *p = cur + sx * d->img_n;
+               switch (d->color) {
+                  case 0:
+                     out[0] = out[1] = out[2] = p[0];
+                     out[3] = (d->has_trns && p[0] == d->trns8[0]) ? 0 : 255;
+                     break;
+                  case 2:
+                     out[0] = p[0];
+                     out[1] = p[1];
+                     out[2] = p[2];
+                     out[3] = (d->has_trns && p[0] == d->trns8[0] &&
+                               p[1] == d->trns8[1] && p[2] == d->trns8[2]) ? 0 : 255;
+                     break;
+                  case 3: {
+                     int pp;
+                     if (p[0] >= d->palette_n)
+                        return stbi__rg_fail(d, "invalid PNG palette index");
+                     pp = p[0] * 4;
+                     out[0] = d->palette[pp+0];
+                     out[1] = d->palette[pp+1];
+                     out[2] = d->palette[pp+2];
+                     out[3] = d->palette[pp+3];
+                     break;
+                  }
+                  case 4:
+                     out[0] = out[1] = out[2] = p[0];
+                     out[3] = p[1];
+                     break;
+                  case 6:
+                     out[0] = p[0];
+                     out[1] = p[1];
+                     out[2] = p[2];
+                     out[3] = p[3];
+                     break;
+               }
+            } else {
+               stbi_uc *p = cur + sx * d->img_n * 2;
+               unsigned r = (unsigned) p[0] << 8 | p[1];
+               switch (d->color) {
+                  case 0:
+                     out[0] = out[1] = out[2] = (stbi_uc) (r >> 8);
+                     out[3] = (d->has_trns && r == d->trns16[0]) ? 0 : 255;
+                     break;
+                  case 2: {
+                     unsigned g = (unsigned) p[2] << 8 | p[3];
+                     unsigned b = (unsigned) p[4] << 8 | p[5];
+                     out[0] = (stbi_uc) (r >> 8);
+                     out[1] = (stbi_uc) (g >> 8);
+                     out[2] = (stbi_uc) (b >> 8);
+                     out[3] = (d->has_trns && r == d->trns16[0] &&
+                               g == d->trns16[1] && b == d->trns16[2]) ? 0 : 255;
+                     break;
+                  }
+                  case 4: {
+                     unsigned a = (unsigned) p[2] << 8 | p[3];
+                     out[0] = out[1] = out[2] = (stbi_uc) (r >> 8);
+                     out[3] = (stbi_uc) (a >> 8);
+                     break;
+                  }
+                  case 6: {
+                     unsigned g = (unsigned) p[2] << 8 | p[3];
+                     unsigned b = (unsigned) p[4] << 8 | p[5];
+                     unsigned a = (unsigned) p[6] << 8 | p[7];
+                     out[0] = (stbi_uc) (r >> 8);
+                     out[1] = (stbi_uc) (g >> 8);
+                     out[2] = (stbi_uc) (b >> 8);
+                     out[3] = (stbi_uc) (a >> 8);
+                     break;
+                  }
+               }
+            }
+            out += 4;
+         }
+
+         if (!d->row_callback(d->user, d->rows_done, d->out_row))
+            return stbi__rg_fail(d, "row callback aborted");
+      }
+
+      {
+         stbi_uc *swap = d->prev_row;
+         d->prev_row = d->cur_row;
+         d->cur_row = swap;
+      }
+      ++d->rows_done;
+      if (d->rows_done >= d->req_y + d->req_h)
+         d->done = 1;
+   }
+
+   return 1;
+}
+
+static int stbi__rg_zrun(stbi_region_decoder *d)
+{
+   stbi__rg_zstream *z = &d->z;
+
+   while (!d->failed && !d->done && z->state != STBI__RG_Z_DONE) {
+      switch (z->state) {
+         case STBI__RG_Z_HEADER:
+            if (!stbi__rg_zneed(z, 16))
+               return 1;
+            {
+               int cmf = (int) stbi__rg_zreceive(z, 8);
+               int flg = (int) stbi__rg_zreceive(z, 8);
+               if (((cmf << 8) + flg) % 31 != 0 || (flg & 32) || (cmf & 15) != 8)
+                  return stbi__rg_fail(d, "bad zlib header");
+            }
+            z->num_bits = 0;
+            z->code_buffer = 0;
+            z->state = STBI__RG_Z_BLOCK_HEADER;
+            break;
+
+         case STBI__RG_Z_BLOCK_HEADER:
+            if (!stbi__rg_zneed(z, 3))
+               return 1;
+            z->final_block = (int) stbi__rg_zreceive(z, 1);
+            {
+               int type = (int) stbi__rg_zreceive(z, 2);
+               if (type == 0) {
+                  z->stored_started = 0;
+                  z->stored_header_have = 0;
+                  z->state = STBI__RG_Z_STORED;
+               } else if (type == 1) {
+                  if (!stbi__zbuild_huffman(&z->z_length, stbi__zdefault_length, STBI__ZNSYMS) ||
+                      !stbi__zbuild_huffman(&z->z_distance, stbi__zdefault_distance, 32))
+                     return stbi__rg_fail(d, "bad fixed Huffman table");
+                  z->huff_phase = 0;
+                  z->state = STBI__RG_Z_HUFFMAN;
+               } else if (type == 2) {
+                  z->dyn_state = STBI__RG_DYN_HEADER;
+                  z->state = STBI__RG_Z_DYNAMIC;
+               } else {
+                  return stbi__rg_fail(d, "bad deflate block type");
+               }
+            }
+            break;
+
+         case STBI__RG_Z_DYNAMIC:
+            if (z->dyn_state == STBI__RG_DYN_HEADER) {
+               if (!stbi__rg_zneed(z, 14))
+                  return 1;
+               z->dyn_hlit = (int) stbi__rg_zreceive(z, 5) + 257;
+               z->dyn_hdist = (int) stbi__rg_zreceive(z, 5) + 1;
+               z->dyn_hclen = (int) stbi__rg_zreceive(z, 4) + 4;
+               z->dyn_ntot = z->dyn_hlit + z->dyn_hdist;
+               if (z->dyn_hlit > 286 || z->dyn_hdist > 32 || z->dyn_ntot > 286+32)
+                  return stbi__rg_fail(d, "bad dynamic Huffman sizes");
+               z->dyn_i = 0;
+               memset(z->dyn_sizes, 0, sizeof(z->dyn_sizes));
+               z->dyn_state = STBI__RG_DYN_SIZES;
+            } else if (z->dyn_state == STBI__RG_DYN_SIZES) {
+               static const stbi_uc length_dezigzag[19] =
+                  { 16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15 };
+               while (z->dyn_i < z->dyn_hclen) {
+                  if (!stbi__rg_zneed(z, 3))
+                     return 1;
+                  z->dyn_sizes[length_dezigzag[z->dyn_i++]] =
+                     (stbi_uc) stbi__rg_zreceive(z, 3);
+               }
+               if (!stbi__zbuild_huffman(&z->dyn_codelength, z->dyn_sizes, 19))
+                  return stbi__rg_fail(d, "bad code-length Huffman table");
+               z->dyn_n = 0;
+               z->dyn_state = STBI__RG_DYN_CODELENGTHS;
+            } else if (z->dyn_state == STBI__RG_DYN_CODELENGTHS) {
+               int symbol;
+               if (z->dyn_n == z->dyn_ntot) {
+                  if (!stbi__zbuild_huffman(&z->z_length, z->dyn_lencodes, z->dyn_hlit) ||
+                      !stbi__zbuild_huffman(&z->z_distance, z->dyn_lencodes + z->dyn_hlit,
+                                            z->dyn_hdist))
+                     return stbi__rg_fail(d, "bad dynamic Huffman table");
+                  z->huff_phase = 0;
+                  z->state = STBI__RG_Z_HUFFMAN;
+                  break;
+               }
+               symbol = stbi__rg_zdecode(z, &z->dyn_codelength);
+               if (symbol == -2)
+                  return 1;
+               if (symbol < 0 || symbol >= 19)
+                  return stbi__rg_fail(d, "bad code-length symbol");
+               if (symbol < 16) {
+                  z->dyn_lencodes[z->dyn_n++] = (stbi_uc) symbol;
+               } else {
+                  if (symbol == 16 && z->dyn_n == 0)
+                     return stbi__rg_fail(d, "bad code-length repeat");
+                  z->dyn_code = symbol;
+                  z->dyn_state = STBI__RG_DYN_REPEAT;
+               }
+            } else {
+               int count, fill = 0;
+               if (z->dyn_code == 16) {
+                  if (!stbi__rg_zneed(z, 2))
+                     return 1;
+                  count = (int) stbi__rg_zreceive(z, 2) + 3;
+                  fill = z->dyn_lencodes[z->dyn_n-1];
+               } else if (z->dyn_code == 17) {
+                  if (!stbi__rg_zneed(z, 3))
+                     return 1;
+                  count = (int) stbi__rg_zreceive(z, 3) + 3;
+               } else {
+                  if (!stbi__rg_zneed(z, 7))
+                     return 1;
+                  count = (int) stbi__rg_zreceive(z, 7) + 11;
+               }
+               if (z->dyn_ntot - z->dyn_n < count)
+                  return stbi__rg_fail(d, "bad code-length repeat");
+               while (count--)
+                  z->dyn_lencodes[z->dyn_n++] = (stbi_uc) fill;
+               z->dyn_state = STBI__RG_DYN_CODELENGTHS;
+            }
+            break;
+
+         case STBI__RG_Z_HUFFMAN:
+            if (z->huff_phase == 0) {
+               int symbol = stbi__rg_zdecode(z, &z->z_length);
+               if (symbol == -2)
+                  return 1;
+               if (symbol < 0)
+                  return stbi__rg_fail(d, "bad literal/length code");
+               if (symbol < 256) {
+                  if (!stbi__rg_emit(d, (stbi_uc) symbol))
+                     return 0;
+                  break;
+               }
+               if (symbol == 256) {
+                  if (z->final_block)
+                     z->state = STBI__RG_Z_DONE;
+                  else
+                     z->state = STBI__RG_Z_BLOCK_HEADER;
+                  break;
+               }
+               if (symbol >= 286)
+                  return stbi__rg_fail(d, "bad length code");
+               z->huff_z = symbol;
+               z->huff_phase = 1;
+            } else if (z->huff_phase == 1) {
+               int index = z->huff_z - 257;
+               int extra = stbi__zlength_extra[index];
+               if (extra && !stbi__rg_zneed(z, extra))
+                  return 1;
+               z->huff_len = stbi__zlength_base[index] +
+                  (extra ? (int) stbi__rg_zreceive(z, extra) : 0);
+               z->huff_phase = 2;
+            } else if (z->huff_phase == 2) {
+               int symbol = stbi__rg_zdecode(z, &z->z_distance);
+               if (symbol == -2)
+                  return 1;
+               if (symbol < 0 || symbol >= 30)
+                  return stbi__rg_fail(d, "bad distance code");
+               z->huff_z = symbol;
+               z->huff_phase = 3;
+            } else if (z->huff_phase == 3) {
+               int extra = stbi__zdist_extra[z->huff_z];
+               if (extra && !stbi__rg_zneed(z, extra))
+                  return 1;
+               z->huff_dist = stbi__zdist_base[z->huff_z] +
+                  (extra ? (int) stbi__rg_zreceive(z, extra) : 0);
+               if (z->huff_dist > d->window_size)
+                  return stbi__rg_fail(d, "invalid deflate distance");
+               z->huff_phase = 4;
+            } else {
+               while (z->huff_len > 0) {
+                  int index = (d->window_pos - z->huff_dist) & (STBI__RG_HISTORY - 1);
+                  stbi_uc value = d->window[index];
+                  if (!stbi__rg_emit(d, value))
+                     return 0;
+                  --z->huff_len;
+                  if (d->done)
+                     break;
+               }
+               z->huff_phase = 0;
+            }
+            break;
+
+         case STBI__RG_Z_STORED:
+            if (!z->stored_started) {
+               if (z->num_bits & 7)
+                  stbi__rg_zreceive(z, z->num_bits & 7);
+               while (z->stored_header_have < 4 && z->num_bits >= 8)
+                  z->stored_header[z->stored_header_have++] =
+                     (stbi_uc) stbi__rg_zreceive(z, 8);
+               while (z->stored_header_have < 4) {
+                  stbi_uc value;
+                  if (!stbi__rg_zbyte(z, &value))
+                     return 1;
+                  z->stored_header[z->stored_header_have++] = value;
+               }
+               {
+                  unsigned len = (unsigned) z->stored_header[1] << 8 | z->stored_header[0];
+                  unsigned nlen = (unsigned) z->stored_header[3] << 8 | z->stored_header[2];
+                  if (nlen != (len ^ 0xffff))
+                     return stbi__rg_fail(d, "bad stored block");
+                  z->stored_remaining = len;
+               }
+               z->stored_started = 1;
+            }
+            while (z->stored_remaining > 0) {
+               stbi_uc value;
+               if (!stbi__rg_zread_byte(z, &value))
+                  return 1;
+               if (!stbi__rg_emit(d, value))
+                  return 0;
+               --z->stored_remaining;
+               if (d->done)
+                  break;
+            }
+            if (z->stored_remaining == 0)
+               z->state = STBI__RG_Z_BLOCK_HEADER;
+            break;
+      }
+   }
+
+   return !d->failed;
+}
+
+static stbi__uint32 stbi__rg_get32be(stbi_uc const *p)
+{
+   return ((stbi__uint32) p[0] << 24) | ((stbi__uint32) p[1] << 16) |
+          ((stbi__uint32) p[2] << 8) | (stbi__uint32) p[3];
+}
+
+static unsigned stbi__rg_get16be(stbi_uc const *p)
+{
+   return ((unsigned) p[0] << 8) | p[1];
+}
+
+static void stbi__rg_free_rows(stbi_region_decoder *d)
+{
+   STBI_FREE(d->in_row);   d->in_row = NULL;
+   STBI_FREE(d->cur_row);  d->cur_row = NULL;
+   STBI_FREE(d->prev_row); d->prev_row = NULL;
+   STBI_FREE(d->out_row);  d->out_row = NULL;
+}
+
+static int stbi__rg_png_ihdr(stbi_region_decoder *d)
+{
+   stbi_uc *p = d->body;
+   int width = (int) stbi__rg_get32be(p + 0);
+   int height = (int) stbi__rg_get32be(p + 4);
+   int i;
+
+   d->depth = p[8];
+   d->color = p[9];
+   d->interlace = p[12];
+
+   if (width <= 0 || height <= 0 ||
+       width > STBI_MAX_DIMENSIONS || height > STBI_MAX_DIMENSIONS)
+      return stbi__rg_fail(d, "invalid PNG dimensions");
+   if (d->depth != 1 && d->depth != 2 && d->depth != 4 &&
+       d->depth != 8 && d->depth != 16)
+      return stbi__rg_fail(d, "unsupported PNG bit depth");
+   if (d->color != 0 && d->color != 2 && d->color != 3 &&
+       d->color != 4 && d->color != 6)
+      return stbi__rg_fail(d, "unsupported PNG color type");
+   if (d->color == 3 && d->depth == 16)
+      return stbi__rg_fail(d, "invalid PNG palette depth");
+   if (p[10] != 0 || p[11] != 0)
+      return stbi__rg_fail(d, "unsupported PNG compression/filter");
+   if (d->interlace != 0)
+      return stbi__rg_fail(d, "interlaced PNG is not supported");
+
+   d->img_n = d->color == 3 ? 1 :
+      (d->color & 2 ? 3 : 1) + (d->color & 4 ? 1 : 0);
+
+   if ((unsigned) d->req_x + (unsigned) d->req_w > (unsigned) width ||
+       (unsigned) d->req_y + (unsigned) d->req_h > (unsigned) height)
+      return stbi__rg_fail(d, "region outside PNG");
+
+   d->raw_row_bytes = (width * d->img_n * d->depth + 7) >> 3;
+   d->filter_bpp = (d->img_n * d->depth + 7) >> 3;
+   if (d->filter_bpp < 1)
+      d->filter_bpp = 1;
+   d->in_row = (stbi_uc *) STBI_MALLOC((size_t) d->raw_row_bytes + 1);
+   d->cur_row = (stbi_uc *) STBI_MALLOC((size_t) d->raw_row_bytes);
+   d->prev_row = (stbi_uc *) STBI_MALLOC((size_t) d->raw_row_bytes);
+   d->out_row = (stbi_uc *) STBI_MALLOC((size_t) d->req_w * 4);
+   if (!d->in_row || !d->cur_row || !d->prev_row || !d->out_row) {
+      stbi__rg_free_rows(d);
+      return stbi__rg_fail(d, "out of memory");
+   }
+   memset(d->prev_row, 0, (size_t) d->raw_row_bytes);
+   memset(d->in_row, 0, (size_t) d->raw_row_bytes + 1);
+   for (i=0; i < 256; ++i)
+      d->palette[i*4+3] = 255;
+
+   d->header_ready = 1;
+   return 1;
+}
+
+static int stbi__rg_png_run(stbi_region_decoder *d, stbi_uc const *src, int len, int *consumed)
+{
+   int pos = 0;
+
+   while (!d->failed && !d->done && pos < len) {
+      switch (d->png_state) {
+         case STBI__RG_PNG_SIGNATURE:
+            while (d->signature_have < 8 && pos < len)
+               d->signature[d->signature_have++] = src[pos++];
+            if (d->signature_have < 8)
+               break;
+            {
+               static const stbi_uc png_sig[8] = { 137,80,78,71,13,10,26,10 };
+               if (memcmp(d->signature, png_sig, 8) != 0) {
+                  stbi__rg_fail(d, "bad PNG signature");
+                  break;
+               }
+            }
+            d->png_state = STBI__RG_PNG_CHUNK_HEADER;
+            break;
+
+         case STBI__RG_PNG_CHUNK_HEADER:
+            while (d->chunk_header_have < 8 && pos < len)
+               d->chunk_header[d->chunk_header_have++] = src[pos++];
+            if (d->chunk_header_have < 8)
+               break;
+            d->chunk_len = stbi__rg_get32be(d->chunk_header);
+            d->chunk_type = stbi__rg_get32be(d->chunk_header + 4);
+            d->chunk_left = d->chunk_len;
+            d->chunk_header_have = 0;
+            d->body_have = 0;
+
+            if (d->chunk_type == STBI__PNG_TYPE('I','H','D','R')) {
+               if (d->header_ready || d->chunk_len != 13) {
+                  stbi__rg_fail(d, "bad PNG IHDR");
+                  break;
+               }
+               d->png_state = STBI__RG_PNG_IHDR;
+            } else if (d->chunk_type == STBI__PNG_TYPE('P','L','T','E')) {
+               if (d->idat_seen || d->chunk_len > 768 || d->chunk_len % 3 != 0) {
+                  stbi__rg_fail(d, "bad PNG PLTE");
+                  break;
+               }
+               d->png_state = STBI__RG_PNG_PLTE;
+            } else if (d->chunk_type == STBI__PNG_TYPE('t','R','N','S')) {
+               if (d->idat_seen || d->chunk_len > 256) {
+                  stbi__rg_fail(d, "bad PNG tRNS");
+                  break;
+               }
+               d->png_state = STBI__RG_PNG_TRNS;
+            } else if (d->chunk_type == STBI__PNG_TYPE('I','D','A','T')) {
+               if (!d->header_ready || d->chunk_len > (1u << 30)) {
+                  stbi__rg_fail(d, "bad PNG IDAT");
+                  break;
+               }
+               if (d->color == 3 && d->palette_n == 0) {
+                  stbi__rg_fail(d, "PNG palette missing");
+                  break;
+               }
+               d->idat_seen = 1;
+               d->png_state = STBI__RG_PNG_IDAT;
+            } else if (d->chunk_type == STBI__PNG_TYPE('I','E','N','D')) {
+               if (d->chunk_len != 0) {
+                  stbi__rg_fail(d, "bad PNG IEND");
+                  break;
+               }
+               stbi__rg_fail(d, "PNG ended before requested region was complete");
+               break;
+            } else if ((d->chunk_type & (1u << 29)) == 0) {
+               stbi__rg_fail(d, "unknown critical PNG chunk");
+               break;
+            } else {
+               d->png_state = STBI__RG_PNG_SKIP;
+            }
+            break;
+
+         case STBI__RG_PNG_IHDR:
+            while (d->body_have < 13 && pos < len)
+               d->body[d->body_have++] = src[pos++];
+            if (d->body_have == 13) {
+               if (!stbi__rg_png_ihdr(d))
+                  break;
+               d->body_have = 0;
+               d->png_state = STBI__RG_PNG_CRC;
+            }
+            break;
+
+         case STBI__RG_PNG_PLTE:
+            while (d->body_have < (int) d->chunk_len && pos < len)
+               d->body[d->body_have++] = src[pos++];
+            if (d->body_have == (int) d->chunk_len) {
+               int i;
+               d->palette_n = (int) d->chunk_len / 3;
+               for (i=0; i < d->palette_n; ++i) {
+                  d->palette[i*4+0] = d->body[i*3+0];
+                  d->palette[i*4+1] = d->body[i*3+1];
+                  d->palette[i*4+2] = d->body[i*3+2];
+                  d->palette[i*4+3] = 255;
+               }
+               d->body_have = 0;
+               d->png_state = STBI__RG_PNG_CRC;
+            }
+            break;
+
+         case STBI__RG_PNG_TRNS:
+            while (d->body_have < (int) d->chunk_len && pos < len)
+               d->body[d->body_have++] = src[pos++];
+            if (d->body_have == (int) d->chunk_len) {
+               int i;
+               if (d->color == 3) {
+                  if (d->palette_n == 0 || (int) d->chunk_len > d->palette_n) {
+                     stbi__rg_fail(d, "bad PNG palette tRNS");
+                     break;
+                  }
+                  for (i=0; i < (int) d->chunk_len; ++i)
+                     d->palette[i*4+3] = d->body[i];
+               } else {
+                  if (d->img_n != 1 && d->img_n != 3) {
+                     stbi__rg_fail(d, "bad PNG tRNS color type");
+                     break;
+                  }
+                  if (d->chunk_len != (stbi__uint32) d->img_n * 2) {
+                     stbi__rg_fail(d, "bad PNG tRNS length");
+                     break;
+                  }
+                  d->has_trns = 1;
+                  for (i=0; i < d->img_n; ++i) {
+                     d->trns16[i] = (stbi__uint16) stbi__rg_get16be(d->body + i*2);
+                     if (d->depth < 16)
+                        d->trns8[i] = (stbi_uc) ((d->trns16[i] & 255) *
+                                                stbi__depth_scale_table[d->depth]);
+                     else
+                        d->trns8[i] = (stbi_uc) (d->trns16[i] >> 8);
+                  }
+               }
+               d->body_have = 0;
+               d->png_state = STBI__RG_PNG_CRC;
+            }
+            break;
+
+         case STBI__RG_PNG_IDAT:
+            if (d->chunk_left == 0) {
+               d->png_state = STBI__RG_PNG_CRC;
+               break;
+            }
+            {
+               int n = len - pos;
+               int used;
+               if ((stbi__uint32) n > d->chunk_left)
+                  n = (int) d->chunk_left;
+               d->z.src = src + pos;
+               d->z.src_left = n;
+               stbi__rg_zrun(d);
+               used = n - d->z.src_left;
+               pos += used;
+               d->chunk_left -= (stbi__uint32) used;
+               if (d->failed)
+                  break;
+               if (d->done)
+                  break;
+               if (d->z.state == STBI__RG_Z_DONE) {
+                  stbi__rg_fail(d, "not enough PNG rows");
+                  break;
+               }
+               if (used == 0)
+                  return 0;
+            }
+            break;
+
+         case STBI__RG_PNG_SKIP:
+            {
+               int n = len - pos;
+               if ((stbi__uint32) n > d->chunk_left)
+                  n = (int) d->chunk_left;
+               pos += n;
+               d->chunk_left -= (stbi__uint32) n;
+            }
+            if (d->chunk_left == 0)
+               d->png_state = STBI__RG_PNG_CRC;
+            break;
+
+         case STBI__RG_PNG_CRC:
+            while (d->body_have < 4 && pos < len)
+               d->body[d->body_have++] = src[pos++];
+            if (d->body_have == 4) {
+               d->body_have = 0;
+               d->png_state = STBI__RG_PNG_CHUNK_HEADER;
+            }
+            break;
+      }
+   }
+
+   *consumed = pos;
+   return !d->failed;
+}
+
+STBIDEF stbi_region_decoder *stbi_region_begin(int x, int y, int width, int height,
+                                               stbi_region_row_callback row_callback,
+                                               void *user)
+{
+   stbi_region_decoder *d;
+   if (!row_callback || x < 0 || y < 0 || width <= 0 || height <= 0)
+      return NULL;
+   if ((unsigned) x + (unsigned) width > 0x7fffffffU ||
+       (unsigned) y + (unsigned) height > 0x7fffffffU)
+      return NULL;
+
+   d = (stbi_region_decoder *) STBI_MALLOC(sizeof(*d));
+   if (!d)
+      return NULL;
+   memset(d, 0, sizeof(*d));
+   d->req_x = x;
+   d->req_y = y;
+   d->req_w = width;
+   d->req_h = height;
+   d->row_callback = row_callback;
+   d->user = user;
+   d->png_state = STBI__RG_PNG_SIGNATURE;
+   d->z.state = STBI__RG_Z_HEADER;
+   return d;
+}
+
+STBIDEF int stbi_region_feed(stbi_region_decoder *d, void const *data, int size)
+{
+   int consumed = 0;
+   if (!d)
+      return 0;
+   if (d->failed || d->ended)
+      return 0;
+   if (d->done)
+      return 1;
+   if (size < 0 || (size > 0 && !data))
+      return stbi__rg_fail(d, "invalid region feed");
+   if (size == 0)
+      return 1;
+
+   stbi__rg_png_run(d, (stbi_uc const *) data, size, &consumed);
+   if (d->done)
+      return 1;
+   if (d->failed)
+      return 0;
+   if (consumed != size)
+      return stbi__rg_fail(d, "region decoder made no progress");
+   return 1;
+}
+
+STBIDEF int stbi_region_finish(stbi_region_decoder *d)
+{
+   if (!d)
+      return 0;
+   if (d->failed)
+      return 0;
+   d->ended = 1;
+   if (d->done)
+      return 1;
+   return stbi__rg_fail(d, "unexpected end of PNG stream");
+}
+
+STBIDEF int stbi_region_complete(stbi_region_decoder const *d)
+{
+   return d && d->done && !d->failed;
+}
+
+STBIDEF char const *stbi_region_failure_reason(stbi_region_decoder const *d)
+{
+   if (!d)
+      return "invalid NULL region decoder";
+   return d->failure ? d->failure : "";
+}
+
+STBIDEF void stbi_region_free(stbi_region_decoder *d)
+{
+   if (!d)
+      return;
+   stbi__rg_free_rows(d);
+   STBI_FREE(d);
 }
 #endif
 
